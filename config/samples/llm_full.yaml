@@ -1,0 +1,42 @@
+# Full-featured example: autoscaling, external Ingress, and Prometheus
+# monitoring on top of GPU serving with a model cache.
+apiVersion: llm.vllm-operator.io/v1alpha1
+kind: LLM
+metadata:
+  name: qwen-prod
+  labels:
+    app.kubernetes.io/name: vllm-operator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  model: Qwen/Qwen2.5-7B-Instruct
+  resources:
+    limits:
+      nvidia.com/gpu: "1"
+  args:
+    maxModelLen: 8192
+    gpuMemoryUtilization: "0.9"
+  modelCache:
+    size: 60Gi
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 4
+    targetGPUUtilization: 75
+  service:
+    port: 8000
+    type: ClusterIP
+  ingress:
+    host: qwen.example.com
+    className: nginx
+    # tlsSecretName: qwen-tls
+  monitoring:
+    serviceMonitor: true
+    interval: 30s
+    labels:
+      release: kube-prometheus-stack
+  # Schedule onto GPU nodes (adjust to your cluster's labels/taints).
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule

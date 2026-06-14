@@ -1,0 +1,39 @@
+# GPU serving with a persistent model cache and a HuggingFace token for gated
+# models. The cache PVC keeps downloaded weights across restarts/rescheduling.
+apiVersion: llm.vllm-operator.io/v1alpha1
+kind: LLM
+metadata:
+  name: llama3
+  labels:
+    app.kubernetes.io/name: vllm-operator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  model: meta-llama/Llama-3.1-8B-Instruct
+  servedModelName: llama3
+  resources:
+    limits:
+      nvidia.com/gpu: "1"
+    requests:
+      cpu: "2"
+      memory: 16Gi
+  args:
+    maxModelLen: 8192
+    gpuMemoryUtilization: "0.92"
+    # Fits an 8B model on a single ~16GB GPU.
+    quantization: awq
+  modelCache:
+    size: 50Gi
+    # storageClassName: fast-ssd   # optional; defaults to the cluster default
+  hfTokenSecret:
+    name: hf-token
+    key: token
+---
+# Create the referenced secret with:
+#   kubectl create secret generic hf-token --from-literal=token=hf_xxx
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hf-token
+type: Opaque
+stringData:
+  token: "REPLACE_WITH_YOUR_HF_TOKEN"

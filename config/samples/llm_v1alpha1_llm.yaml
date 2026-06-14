@@ -1,9 +1,16 @@
+# Minimal example: serve a small instruct model on a single GPU.
 apiVersion: llm.vllm-operator.io/v1alpha1
 kind: LLM
 metadata:
+  name: qwen
   labels:
     app.kubernetes.io/name: vllm-operator
     app.kubernetes.io/managed-by: kustomize
-  name: llm-sample
 spec:
-  # TODO(user): Add fields here
+  model: Qwen/Qwen2.5-1.5B-Instruct
+  resources:
+    limits:
+      nvidia.com/gpu: "1"
+  args:
+    maxModelLen: 4096
+    gpuMemoryUtilization: "0.9"
