@@ -18,67 +18,206 @@ package controller
 
 import (
 	"context"
+	"slices"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	llmv1alpha1 "github.com/youngcheor/vllm-operator/api/v1alpha1"
 )
 
-var _ = Describe("LLM Controller", func() {
-	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
-
-		ctx := context.Background()
-
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+// argValue returns the value following the given flag in an argument slice.
+func argValue(args []string, flag string) string {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1]
 		}
+	}
+	return ""
+}
+
+// hasArg reports whether the flag is present in the argument slice.
+func hasArg(args []string, flag string) bool {
+	return slices.Contains(args, flag)
+}
+
+var _ = Describe("LLM Controller", func() {
+	const namespace = "default"
+
+	ctx := context.Background()
+
+	newReconciler := func() *LLMReconciler {
+		return &LLMReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+	}
+
+	reconcileOnce := func(name string) {
+		_, err := newReconciler().Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
+		})
+		Expect(err).NotTo(HaveOccurred())
+	}
+
+	deleteLLM := func(name string) {
 		llm := &llmv1alpha1.LLM{}
+		key := types.NamespacedName{Name: name, Namespace: namespace}
+		if err := k8sClient.Get(ctx, key, llm); err == nil {
+			Expect(k8sClient.Delete(ctx, llm)).To(Succeed())
+		} else {
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+		}
+		// envtest has no garbage collector, so remove owned objects explicitly.
+		_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
+		_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
+	}
+
+	getDeployment := func(name string) *appsv1.Deployment {
+		deploy := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, deploy)).To(Succeed())
+		return deploy
+	}
+
+	Context("When reconciling a basic LLM", func() {
+		const resourceName = "test-basic"
 
 		BeforeEach(func() {
-			By("creating the custom resource for the Kind LLM")
-			err := k8sClient.Get(ctx, typeNamespacedName, llm)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &llmv1alpha1.LLM{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
-					},
-					// TODO(user): Specify other spec details if needed.
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			llm := &llmv1alpha1.LLM{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace},
+				Spec: llmv1alpha1.LLMSpec{
+					Model: "Qwen/Qwen2.5-1.5B-Instruct",
+				},
 			}
+			Expect(k8sClient.Create(ctx, llm)).To(Succeed())
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &llmv1alpha1.LLM{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Cleanup the specific resource instance LLM")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			deleteLLM(resourceName)
 		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &LLMReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+		It("creates a Deployment fronted by a Service", func() {
+			reconcileOnce(resourceName)
+
+			By("creating a Deployment running vLLM")
+			deploy := getDeployment(resourceName)
+			Expect(deploy.Spec.Template.Spec.Containers).To(HaveLen(1))
+			container := deploy.Spec.Template.Spec.Containers[0]
+			Expect(container.Name).To(Equal(containerName))
+			Expect(container.Image).To(Equal(defaultImage))
+			Expect(*deploy.Spec.Replicas).To(Equal(int32(1)))
+
+			By("passing the model and port to vLLM")
+			Expect(argValue(container.Args, "--model")).To(Equal("Qwen/Qwen2.5-1.5B-Instruct"))
+			Expect(argValue(container.Args, "--served-model-name")).To(Equal("Qwen/Qwen2.5-1.5B-Instruct"))
+			Expect(argValue(container.Args, "--port")).To(Equal("8000"))
+
+			By("configuring a /health readiness probe")
+			Expect(container.ReadinessProbe).NotTo(BeNil())
+			Expect(container.ReadinessProbe.HTTPGet.Path).To(Equal("/health"))
+
+			By("setting an owner reference back to the LLM")
+			Expect(deploy.OwnerReferences).To(HaveLen(1))
+			Expect(deploy.OwnerReferences[0].Kind).To(Equal("LLM"))
+			Expect(deploy.OwnerReferences[0].Name).To(Equal(resourceName))
+
+			By("creating a Service on port 8000")
+			svc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName, Namespace: namespace}, svc)).To(Succeed())
+			Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
+			Expect(svc.Spec.Ports).To(HaveLen(1))
+			Expect(svc.Spec.Ports[0].Port).To(Equal(int32(8000)))
+
+			By("reporting status with an endpoint and Progressing phase")
+			llm := &llmv1alpha1.LLM{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName, Namespace: namespace}, llm)).To(Succeed())
+			Expect(llm.Status.Phase).To(Equal(llmv1alpha1.LLMPhaseProgressing))
+			Expect(llm.Status.Endpoint).To(Equal("http://test-basic.default.svc:8000/v1"))
+			Expect(llm.Status.ObservedGeneration).To(Equal(llm.Generation))
+		})
+	})
+
+	Context("When the LLM specifies engine args and a custom port", func() {
+		const resourceName = "test-args"
+
+		BeforeEach(func() {
+			llm := &llmv1alpha1.LLM{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace},
+				Spec: llmv1alpha1.LLMSpec{
+					Model:           "meta-llama/Llama-3.1-8B-Instruct",
+					ServedModelName: "llama3",
+					Service:         llmv1alpha1.ServiceSpec{Port: 9000},
+					Args: llmv1alpha1.VLLMArgs{
+						TensorParallelSize:   ptr.To(int32(2)),
+						DType:                "bfloat16",
+						MaxModelLen:          ptr.To(int32(4096)),
+						GPUMemoryUtilization: "0.9",
+						TrustRemoteCode:      ptr.To(true),
+					},
+					ExtraArgs: []string{"--enable-prefix-caching"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, llm)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			deleteLLM(resourceName)
+		})
+
+		It("renders the args onto the vLLM command line", func() {
+			reconcileOnce(resourceName)
+
+			container := getDeployment(resourceName).Spec.Template.Spec.Containers[0]
+			Expect(argValue(container.Args, "--served-model-name")).To(Equal("llama3"))
+			Expect(argValue(container.Args, "--port")).To(Equal("9000"))
+			Expect(argValue(container.Args, "--tensor-parallel-size")).To(Equal("2"))
+			Expect(argValue(container.Args, "--dtype")).To(Equal("bfloat16"))
+			Expect(argValue(container.Args, "--max-model-len")).To(Equal("4096"))
+			Expect(argValue(container.Args, "--gpu-memory-utilization")).To(Equal("0.9"))
+			Expect(hasArg(container.Args, "--trust-remote-code")).To(BeTrue())
+			Expect(hasArg(container.Args, "--enable-prefix-caching")).To(BeTrue())
+			Expect(container.Ports[0].ContainerPort).To(Equal(int32(9000)))
+		})
+	})
+
+	Context("When the replica count changes", func() {
+		const resourceName = "test-scale"
+
+		BeforeEach(func() {
+			llm := &llmv1alpha1.LLM{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace},
+				Spec: llmv1alpha1.LLMSpec{
+					Model:    "Qwen/Qwen2.5-1.5B-Instruct",
+					Replicas: ptr.To(int32(1)),
+				},
+			}
+			Expect(k8sClient.Create(ctx, llm)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			deleteLLM(resourceName)
+		})
+
+		It("propagates the new replica count to the Deployment", func() {
+			reconcileOnce(resourceName)
+			Expect(*getDeployment(resourceName).Spec.Replicas).To(Equal(int32(1)))
+
+			By("scaling the LLM to 3 replicas")
+			llm := &llmv1alpha1.LLM{}
+			key := types.NamespacedName{Name: resourceName, Namespace: namespace}
+			Expect(k8sClient.Get(ctx, key, llm)).To(Succeed())
+			llm.Spec.Replicas = ptr.To(int32(3))
+			Expect(k8sClient.Update(ctx, llm)).To(Succeed())
+
+			reconcileOnce(resourceName)
+			Expect(*getDeployment(resourceName).Spec.Replicas).To(Equal(int32(3)))
 		})
 	})
 })
