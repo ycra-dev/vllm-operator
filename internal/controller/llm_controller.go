@@ -22,6 +22,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -44,6 +45,7 @@ type LLMReconciler struct {
 // +kubebuilder:rbac:groups=llm.vllm-operator.io,resources=llms/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives the cluster state toward the desired state described by an
 // LLM resource: it ensures the backing Deployment and Service exist and keeps
@@ -56,6 +58,11 @@ func (r *LLMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		// Ignore not-found: the resource was deleted and owned objects are
 		// garbage-collected via owner references.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if err := r.reconcilePVC(ctx, &llm); err != nil {
+		log.Error(err, "Failed to reconcile model cache PVC")
+		return r.markDegraded(ctx, &llm, "PVCError", err)
 	}
 
 	if err := r.reconcileDeployment(ctx, &llm); err != nil {
@@ -74,6 +81,36 @@ func (r *LLMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// reconcilePVC ensures the model cache PersistentVolumeClaim exists when caching
+// is enabled. A PVC's spec is largely immutable after creation, so it is created
+// once and otherwise left untouched.
+func (r *LLMReconciler) reconcilePVC(ctx context.Context, llm *llmv1alpha1.LLM) error {
+	if llm.Spec.ModelCache == nil {
+		return nil
+	}
+	log := logf.FromContext(ctx)
+
+	pvc := &corev1.PersistentVolumeClaim{}
+	key := client.ObjectKey{Name: pvcName(llm), Namespace: llm.Namespace}
+	err := r.Get(ctx, key, pvc)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	pvc = buildPVC(llm)
+	if err := controllerutil.SetControllerReference(llm, pvc, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.Create(ctx, pvc); err != nil {
+		return err
+	}
+	log.Info("Created model cache PVC", "name", pvc.Name)
+	return nil
 }
 
 // reconcileDeployment creates or updates the vLLM Deployment.
@@ -192,6 +229,7 @@ func (r *LLMReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&llmv1alpha1.LLM{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.PersistentVolumeClaim{}).
 		Named("llm").
 		Complete(r)
 }

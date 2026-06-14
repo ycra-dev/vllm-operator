@@ -25,6 +25,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -78,6 +79,7 @@ var _ = Describe("LLM Controller", func() {
 		// envtest has no garbage collector, so remove owned objects explicitly.
 		_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
 		_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
+		_ = k8sClient.Delete(ctx, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name + "-cache", Namespace: namespace}})
 	}
 
 	getDeployment := func(name string) *appsv1.Deployment {
@@ -218,6 +220,90 @@ var _ = Describe("LLM Controller", func() {
 
 			reconcileOnce(resourceName)
 			Expect(*getDeployment(resourceName).Spec.Replicas).To(Equal(int32(3)))
+		})
+	})
+
+	Context("When model caching is enabled", func() {
+		const resourceName = "test-cache"
+
+		BeforeEach(func() {
+			llm := &llmv1alpha1.LLM{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace},
+				Spec: llmv1alpha1.LLMSpec{
+					Model: "Qwen/Qwen2.5-1.5B-Instruct",
+					ModelCache: &llmv1alpha1.ModelCacheSpec{
+						Size: resource.MustParse("20Gi"),
+					},
+					HFTokenSecret: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "hf-token"},
+						Key:                  "token",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, llm)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			deleteLLM(resourceName)
+		})
+
+		It("creates a PVC and mounts it into the vLLM container", func() {
+			reconcileOnce(resourceName)
+
+			By("creating a cache PVC of the requested size")
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-cache", Namespace: namespace}, pvc)).To(Succeed())
+			Expect(pvc.Spec.AccessModes).To(ContainElement(corev1.ReadWriteOnce))
+			Expect(pvc.Spec.Resources.Requests.Storage().String()).To(Equal("20Gi"))
+			Expect(pvc.OwnerReferences).To(HaveLen(1))
+			Expect(pvc.OwnerReferences[0].Name).To(Equal(resourceName))
+
+			By("mounting the PVC at the HuggingFace cache path")
+			podSpec := getDeployment(resourceName).Spec.Template.Spec
+			Expect(podSpec.Volumes).To(HaveLen(1))
+			Expect(podSpec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(resourceName + "-cache"))
+			container := podSpec.Containers[0]
+			Expect(container.VolumeMounts).To(HaveLen(1))
+			Expect(container.VolumeMounts[0].MountPath).To(Equal("/root/.cache/huggingface"))
+
+			By("injecting the HF token and HF_HOME env")
+			var hasToken, hasHFHome bool
+			for _, e := range container.Env {
+				if e.Name == "HUGGING_FACE_HUB_TOKEN" && e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+					hasToken = e.ValueFrom.SecretKeyRef.Name == "hf-token"
+				}
+				if e.Name == "HF_HOME" && e.Value == "/root/.cache/huggingface" {
+					hasHFHome = true
+				}
+			}
+			Expect(hasToken).To(BeTrue(), "expected HUGGING_FACE_HUB_TOKEN from secret hf-token")
+			Expect(hasHFHome).To(BeTrue(), "expected HF_HOME pointing at the cache mount")
+		})
+	})
+
+	Context("When model caching is disabled", func() {
+		const resourceName = "test-nocache"
+
+		BeforeEach(func() {
+			llm := &llmv1alpha1.LLM{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace},
+				Spec:       llmv1alpha1.LLMSpec{Model: "Qwen/Qwen2.5-1.5B-Instruct"},
+			}
+			Expect(k8sClient.Create(ctx, llm)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			deleteLLM(resourceName)
+		})
+
+		It("does not create a PVC or cache volume", func() {
+			reconcileOnce(resourceName)
+
+			pvc := &corev1.PersistentVolumeClaim{}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-cache", Namespace: namespace}, pvc)
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+
+			Expect(getDeployment(resourceName).Spec.Template.Spec.Volumes).To(BeEmpty())
 		})
 	})
 })

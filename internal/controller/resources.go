@@ -22,6 +22,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -38,6 +39,13 @@ const (
 	containerName = "vllm"
 	// httpPortName is the named port exposing the API (and /metrics).
 	httpPortName = "http"
+	// cacheVolumeName is the name of the model cache volume.
+	cacheVolumeName = "model-cache"
+	// defaultCacheMountPath is the default in-container path for the model cache,
+	// matching the HuggingFace cache location.
+	defaultCacheMountPath = "/root/.cache/huggingface"
+	// defaultCacheSize is the default model cache PVC size.
+	defaultCacheSize = "50Gi"
 )
 
 // labelsFor returns the full label set applied to all child objects.
@@ -102,6 +110,20 @@ func endpointFor(llm *llmv1alpha1.LLM) string {
 	return fmt.Sprintf("http://%s.%s.svc:%d/v1", llm.Name, llm.Namespace, vllmPort(llm))
 }
 
+// pvcName returns the name of the model cache PVC for the given LLM.
+func pvcName(llm *llmv1alpha1.LLM) string {
+	return llm.Name + "-cache"
+}
+
+// cacheMountPath returns the in-container mount path for the model cache,
+// defaulting to the HuggingFace cache directory.
+func cacheMountPath(llm *llmv1alpha1.LLM) string {
+	if llm.Spec.ModelCache != nil && llm.Spec.ModelCache.MountPath != "" {
+		return llm.Spec.ModelCache.MountPath
+	}
+	return defaultCacheMountPath
+}
+
 // buildArgs renders the vLLM server command-line arguments from the spec.
 func buildArgs(llm *llmv1alpha1.LLM) []string {
 	args := []string{
@@ -150,6 +172,10 @@ func buildEnv(llm *llmv1alpha1.LLM) []corev1.EnvVar {
 			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: llm.Spec.HFTokenSecret},
 		})
 	}
+	// When a cache is mounted at a non-default location, point HuggingFace at it.
+	if llm.Spec.ModelCache != nil {
+		env = append(env, corev1.EnvVar{Name: "HF_HOME", Value: cacheMountPath(llm)})
+	}
 	env = append(env, llm.Spec.Env...)
 	return env
 }
@@ -191,12 +217,59 @@ func buildPodSpec(llm *llmv1alpha1.LLM) corev1.PodSpec {
 		LivenessProbe:  healthProbe(port, 20, 3),
 	}
 
+	var volumes []corev1.Volume
+	if llm.Spec.ModelCache != nil {
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      cacheVolumeName,
+			MountPath: cacheMountPath(llm),
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: cacheVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: pvcName(llm),
+				},
+			},
+		})
+	}
+
 	return corev1.PodSpec{
 		Containers:       []corev1.Container{container},
+		Volumes:          volumes,
 		NodeSelector:     llm.Spec.NodeSelector,
 		Tolerations:      llm.Spec.Tolerations,
 		Affinity:         llm.Spec.Affinity,
 		ImagePullSecrets: llm.Spec.ImagePullSecrets,
+	}
+}
+
+// buildPVC returns the desired model cache PersistentVolumeClaim for the LLM.
+func buildPVC(llm *llmv1alpha1.LLM) *corev1.PersistentVolumeClaim {
+	cache := llm.Spec.ModelCache
+
+	accessModes := cache.AccessModes
+	if len(accessModes) == 0 {
+		accessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	}
+
+	size := cache.Size
+	if size.IsZero() {
+		size = resource.MustParse(defaultCacheSize)
+	}
+
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pvcName(llm),
+			Namespace: llm.Namespace,
+			Labels:    labelsFor(llm),
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      accessModes,
+			StorageClassName: cache.StorageClassName,
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: size},
+			},
+		},
 	}
 }
 
