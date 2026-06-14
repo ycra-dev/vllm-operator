@@ -21,6 +21,7 @@ import (
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,6 +47,12 @@ const (
 	defaultCacheMountPath = "/root/.cache/huggingface"
 	// defaultCacheSize is the default model cache PVC size.
 	defaultCacheSize = "50Gi"
+	// gpuMetricName is the per-pod GPU utilization metric used for autoscaling,
+	// as exported by the NVIDIA DCGM exporter.
+	gpuMetricName = "DCGM_FI_DEV_GPU_UTIL"
+	// defaultCPUUtilization is the CPU target used when autoscaling is enabled
+	// but no metric target is specified.
+	defaultCPUUtilization = int32(80)
 )
 
 // labelsFor returns the full label set applied to all child objects.
@@ -315,6 +322,74 @@ func buildService(llm *llmv1alpha1.LLM) *corev1.Service {
 				TargetPort: intstr.FromInt32(port),
 				Protocol:   corev1.ProtocolTCP,
 			}},
+		},
+	}
+}
+
+// buildHPA returns the desired HorizontalPodAutoscaler targeting the LLM's
+// Deployment. Only called when autoscaling is enabled.
+func buildHPA(llm *llmv1alpha1.LLM) *autoscalingv2.HorizontalPodAutoscaler {
+	as := llm.Spec.Autoscaling
+
+	minReplicas := ptr.To(int32(1))
+	if as.MinReplicas != nil {
+		minReplicas = as.MinReplicas
+	}
+
+	var metrics []autoscalingv2.MetricSpec
+	if as.TargetCPUUtilization != nil {
+		metrics = append(metrics, autoscalingv2.MetricSpec{
+			Type: autoscalingv2.ResourceMetricSourceType,
+			Resource: &autoscalingv2.ResourceMetricSource{
+				Name: corev1.ResourceCPU,
+				Target: autoscalingv2.MetricTarget{
+					Type:               autoscalingv2.UtilizationMetricType,
+					AverageUtilization: as.TargetCPUUtilization,
+				},
+			},
+		})
+	}
+	if as.TargetGPUUtilization != nil {
+		metrics = append(metrics, autoscalingv2.MetricSpec{
+			Type: autoscalingv2.PodsMetricSourceType,
+			Pods: &autoscalingv2.PodsMetricSource{
+				Metric: autoscalingv2.MetricIdentifier{Name: gpuMetricName},
+				Target: autoscalingv2.MetricTarget{
+					Type:         autoscalingv2.AverageValueMetricType,
+					AverageValue: resource.NewQuantity(int64(*as.TargetGPUUtilization), resource.DecimalSI),
+				},
+			},
+		})
+	}
+	// Fall back to a CPU target so the HPA always has at least one metric.
+	if len(metrics) == 0 {
+		metrics = append(metrics, autoscalingv2.MetricSpec{
+			Type: autoscalingv2.ResourceMetricSourceType,
+			Resource: &autoscalingv2.ResourceMetricSource{
+				Name: corev1.ResourceCPU,
+				Target: autoscalingv2.MetricTarget{
+					Type:               autoscalingv2.UtilizationMetricType,
+					AverageUtilization: ptr.To(defaultCPUUtilization),
+				},
+			},
+		})
+	}
+
+	return &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      llm.Name,
+			Namespace: llm.Namespace,
+			Labels:    labelsFor(llm),
+		},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       llm.Name,
+			},
+			MinReplicas: minReplicas,
+			MaxReplicas: as.MaxReplicas,
+			Metrics:     metrics,
 		},
 	}
 }

@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -80,6 +81,7 @@ var _ = Describe("LLM Controller", func() {
 		_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
 		_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
 		_ = k8sClient.Delete(ctx, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name + "-cache", Namespace: namespace}})
+		_ = k8sClient.Delete(ctx, &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
 	}
 
 	getDeployment := func(name string) *appsv1.Deployment {
@@ -304,6 +306,109 @@ var _ = Describe("LLM Controller", func() {
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 
 			Expect(getDeployment(resourceName).Spec.Template.Spec.Volumes).To(BeEmpty())
+		})
+	})
+
+	getHPA := func(name string) (*autoscalingv2.HorizontalPodAutoscaler, error) {
+		hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, hpa)
+		return hpa, err
+	}
+
+	Context("When autoscaling is enabled", func() {
+		const resourceName = "test-hpa"
+
+		BeforeEach(func() {
+			llm := &llmv1alpha1.LLM{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace},
+				Spec: llmv1alpha1.LLMSpec{
+					Model: "Qwen/Qwen2.5-1.5B-Instruct",
+					Autoscaling: &llmv1alpha1.AutoscalingSpec{
+						MinReplicas:          ptr.To(int32(2)),
+						MaxReplicas:          5,
+						TargetCPUUtilization: ptr.To(int32(70)),
+						TargetGPUUtilization: ptr.To(int32(80)),
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, llm)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			deleteLLM(resourceName)
+		})
+
+		It("creates an HPA targeting the Deployment and leaves replicas unmanaged", func() {
+			reconcileOnce(resourceName)
+
+			By("creating an HPA with the configured bounds")
+			hpa, err := getHPA(resourceName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(*hpa.Spec.MinReplicas).To(Equal(int32(2)))
+			Expect(hpa.Spec.MaxReplicas).To(Equal(int32(5)))
+			Expect(hpa.Spec.ScaleTargetRef.Kind).To(Equal("Deployment"))
+			Expect(hpa.Spec.ScaleTargetRef.Name).To(Equal(resourceName))
+			Expect(hpa.OwnerReferences).To(HaveLen(1))
+			Expect(hpa.OwnerReferences[0].Name).To(Equal(resourceName))
+
+			By("configuring both CPU and GPU metrics")
+			var hasCPU, hasGPU bool
+			for _, m := range hpa.Spec.Metrics {
+				if m.Type == autoscalingv2.ResourceMetricSourceType && m.Resource.Name == corev1.ResourceCPU {
+					hasCPU = *m.Resource.Target.AverageUtilization == int32(70)
+				}
+				if m.Type == autoscalingv2.PodsMetricSourceType {
+					hasGPU = m.Pods.Metric.Name == "DCGM_FI_DEV_GPU_UTIL"
+				}
+			}
+			Expect(hasCPU).To(BeTrue(), "expected CPU utilization metric at 70%")
+			Expect(hasGPU).To(BeTrue(), "expected GPU pods metric")
+
+			By("not overwriting replicas scaled by the HPA on subsequent reconciles")
+			deploy := getDeployment(resourceName)
+			deploy.Spec.Replicas = ptr.To(int32(4)) // simulate the HPA scaling up
+			Expect(k8sClient.Update(ctx, deploy)).To(Succeed())
+
+			reconcileOnce(resourceName)
+			Expect(*getDeployment(resourceName).Spec.Replicas).To(Equal(int32(4)))
+		})
+	})
+
+	Context("When autoscaling is toggled off", func() {
+		const resourceName = "test-hpa-off"
+
+		BeforeEach(func() {
+			llm := &llmv1alpha1.LLM{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace},
+				Spec: llmv1alpha1.LLMSpec{
+					Model: "Qwen/Qwen2.5-1.5B-Instruct",
+					Autoscaling: &llmv1alpha1.AutoscalingSpec{
+						MaxReplicas: 3,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, llm)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			deleteLLM(resourceName)
+		})
+
+		It("deletes the HPA when autoscaling is removed", func() {
+			reconcileOnce(resourceName)
+			_, err := getHPA(resourceName)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("removing the autoscaling spec")
+			llm := &llmv1alpha1.LLM{}
+			key := types.NamespacedName{Name: resourceName, Namespace: namespace}
+			Expect(k8sClient.Get(ctx, key, llm)).To(Succeed())
+			llm.Spec.Autoscaling = nil
+			Expect(k8sClient.Update(ctx, llm)).To(Succeed())
+
+			reconcileOnce(resourceName)
+			_, err = getHPA(resourceName)
+			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 	})
 })

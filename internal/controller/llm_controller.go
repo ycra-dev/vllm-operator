@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -46,6 +47,7 @@ type LLMReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives the cluster state toward the desired state described by an
 // LLM resource: it ensures the backing Deployment and Service exist and keeps
@@ -73,6 +75,11 @@ func (r *LLMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	if err := r.reconcileService(ctx, &llm); err != nil {
 		log.Error(err, "Failed to reconcile Service")
 		return r.markDegraded(ctx, &llm, "ServiceError", err)
+	}
+
+	if err := r.reconcileHPA(ctx, &llm); err != nil {
+		log.Error(err, "Failed to reconcile HorizontalPodAutoscaler")
+		return r.markDegraded(ctx, &llm, "HPAError", err)
 	}
 
 	if err := r.updateStatus(ctx, &llm); err != nil {
@@ -123,7 +130,11 @@ func (r *LLMReconciler) reconcileDeployment(ctx context.Context, llm *llmv1alpha
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, deploy, func() error {
 		desired := buildDeployment(llm)
 		deploy.Labels = desired.Labels
-		deploy.Spec.Replicas = desired.Spec.Replicas
+		// When autoscaling is enabled the HPA owns the replica count, so leave
+		// the existing value untouched; otherwise enforce the desired count.
+		if desired.Spec.Replicas != nil {
+			deploy.Spec.Replicas = desired.Spec.Replicas
+		}
 		deploy.Spec.Selector = desired.Spec.Selector
 		deploy.Spec.Template = desired.Spec.Template
 		return controllerutil.SetControllerReference(llm, deploy, r.Scheme)
@@ -157,6 +168,43 @@ func (r *LLMReconciler) reconcileService(ctx context.Context, llm *llmv1alpha1.L
 	}
 	if op != controllerutil.OperationResultNone {
 		log.Info("Reconciled Service", "operation", op, "name", svc.Name)
+	}
+	return nil
+}
+
+// reconcileHPA creates or updates the HorizontalPodAutoscaler when autoscaling
+// is enabled, and deletes any existing HPA when it is disabled.
+func (r *LLMReconciler) reconcileHPA(ctx context.Context, llm *llmv1alpha1.LLM) error {
+	log := logf.FromContext(ctx)
+	key := client.ObjectKey{Name: llm.Name, Namespace: llm.Namespace}
+
+	if llm.Spec.Autoscaling == nil {
+		// Autoscaling disabled: remove a previously created HPA if present.
+		existing := &autoscalingv2.HorizontalPodAutoscaler{}
+		if err := r.Get(ctx, key, existing); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if err := r.Delete(ctx, existing); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		log.Info("Deleted HorizontalPodAutoscaler", "name", existing.Name)
+		return nil
+	}
+
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{Name: llm.Name, Namespace: llm.Namespace},
+	}
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, hpa, func() error {
+		desired := buildHPA(llm)
+		hpa.Labels = desired.Labels
+		hpa.Spec = desired.Spec
+		return controllerutil.SetControllerReference(llm, hpa, r.Scheme)
+	})
+	if err != nil {
+		return err
+	}
+	if op != controllerutil.OperationResultNone {
+		log.Info("Reconciled HorizontalPodAutoscaler", "operation", op, "name", hpa.Name)
 	}
 	return nil
 }
@@ -230,6 +278,7 @@ func (r *LLMReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
+		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Named("llm").
 		Complete(r)
 }
