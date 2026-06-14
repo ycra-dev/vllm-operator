@@ -18,11 +18,14 @@ package controller
 
 import (
 	"fmt"
+	"maps"
 	"strconv"
 
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -53,6 +56,12 @@ const (
 	// defaultCPUUtilization is the CPU target used when autoscaling is enabled
 	// but no metric target is specified.
 	defaultCPUUtilization = int32(80)
+	// metricsPath is the HTTP path vLLM exposes Prometheus metrics on.
+	metricsPath = "/metrics"
+	// defaultScrapeInterval is the ServiceMonitor scrape interval default.
+	defaultScrapeInterval = "30s"
+	// defaultIngressPath is the default HTTP path prefix for the Ingress.
+	defaultIngressPath = "/"
 )
 
 // labelsFor returns the full label set applied to all child objects.
@@ -390,6 +399,87 @@ func buildHPA(llm *llmv1alpha1.LLM) *autoscalingv2.HorizontalPodAutoscaler {
 			MinReplicas: minReplicas,
 			MaxReplicas: as.MaxReplicas,
 			Metrics:     metrics,
+		},
+	}
+}
+
+// buildIngress returns the desired Ingress for the LLM. Only called when an
+// Ingress is configured.
+func buildIngress(llm *llmv1alpha1.LLM) *networkingv1.Ingress {
+	ing := llm.Spec.Ingress
+
+	path := ing.Path
+	if path == "" {
+		path = defaultIngressPath
+	}
+	pathType := networkingv1.PathTypePrefix
+
+	rule := networkingv1.IngressRule{
+		Host: ing.Host,
+		IngressRuleValue: networkingv1.IngressRuleValue{
+			HTTP: &networkingv1.HTTPIngressRuleValue{
+				Paths: []networkingv1.HTTPIngressPath{{
+					Path:     path,
+					PathType: &pathType,
+					Backend: networkingv1.IngressBackend{
+						Service: &networkingv1.IngressServiceBackend{
+							Name: llm.Name,
+							Port: networkingv1.ServiceBackendPort{Number: vllmPort(llm)},
+						},
+					},
+				}},
+			},
+		},
+	}
+
+	obj := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        llm.Name,
+			Namespace:   llm.Namespace,
+			Labels:      labelsFor(llm),
+			Annotations: ing.Annotations,
+		},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: ing.ClassName,
+			Rules:            []networkingv1.IngressRule{rule},
+		},
+	}
+	if ing.TLSSecretName != "" {
+		obj.Spec.TLS = []networkingv1.IngressTLS{{
+			Hosts:      []string{ing.Host},
+			SecretName: ing.TLSSecretName,
+		}}
+	}
+	return obj
+}
+
+// buildServiceMonitor returns the desired Prometheus ServiceMonitor scraping the
+// vLLM /metrics endpoint. Only called when monitoring is enabled.
+func buildServiceMonitor(llm *llmv1alpha1.LLM) *monitoringv1.ServiceMonitor {
+	mon := llm.Spec.Monitoring
+
+	interval := mon.Interval
+	if interval == "" {
+		interval = defaultScrapeInterval
+	}
+
+	// Merge user labels so a Prometheus instance can select this monitor.
+	labels := labelsFor(llm)
+	maps.Copy(labels, mon.Labels)
+
+	return &monitoringv1.ServiceMonitor{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      llm.Name,
+			Namespace: llm.Namespace,
+			Labels:    labels,
+		},
+		Spec: monitoringv1.ServiceMonitorSpec{
+			Selector: metav1.LabelSelector{MatchLabels: selectorLabelsFor(llm)},
+			Endpoints: []monitoringv1.Endpoint{{
+				Port:     httpPortName,
+				Path:     metricsPath,
+				Interval: monitoringv1.Duration(interval),
+			}},
 		},
 	}
 }

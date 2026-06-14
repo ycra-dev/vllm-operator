@@ -20,13 +20,16 @@ import (
 	"context"
 	"fmt"
 
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -48,6 +51,8 @@ type LLMReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives the cluster state toward the desired state described by an
 // LLM resource: it ensures the backing Deployment and Service exist and keeps
@@ -80,6 +85,16 @@ func (r *LLMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	if err := r.reconcileHPA(ctx, &llm); err != nil {
 		log.Error(err, "Failed to reconcile HorizontalPodAutoscaler")
 		return r.markDegraded(ctx, &llm, "HPAError", err)
+	}
+
+	if err := r.reconcileIngress(ctx, &llm); err != nil {
+		log.Error(err, "Failed to reconcile Ingress")
+		return r.markDegraded(ctx, &llm, "IngressError", err)
+	}
+
+	if err := r.reconcileServiceMonitor(ctx, &llm); err != nil {
+		log.Error(err, "Failed to reconcile ServiceMonitor")
+		return r.markDegraded(ctx, &llm, "ServiceMonitorError", err)
 	}
 
 	if err := r.updateStatus(ctx, &llm); err != nil {
@@ -209,6 +224,100 @@ func (r *LLMReconciler) reconcileHPA(ctx context.Context, llm *llmv1alpha1.LLM) 
 	return nil
 }
 
+// reconcileIngress creates or updates the Ingress when configured, and deletes
+// any existing Ingress when it is removed from the spec.
+func (r *LLMReconciler) reconcileIngress(ctx context.Context, llm *llmv1alpha1.LLM) error {
+	log := logf.FromContext(ctx)
+	key := client.ObjectKey{Name: llm.Name, Namespace: llm.Namespace}
+
+	if llm.Spec.Ingress == nil {
+		existing := &networkingv1.Ingress{}
+		if err := r.Get(ctx, key, existing); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if err := r.Delete(ctx, existing); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		log.Info("Deleted Ingress", "name", existing.Name)
+		return nil
+	}
+
+	ing := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Name: llm.Name, Namespace: llm.Namespace},
+	}
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, ing, func() error {
+		desired := buildIngress(llm)
+		ing.Labels = desired.Labels
+		ing.Annotations = desired.Annotations
+		ing.Spec = desired.Spec
+		return controllerutil.SetControllerReference(llm, ing, r.Scheme)
+	})
+	if err != nil {
+		return err
+	}
+	if op != controllerutil.OperationResultNone {
+		log.Info("Reconciled Ingress", "operation", op, "name", ing.Name)
+	}
+	return nil
+}
+
+// serviceMonitorSupported reports whether the Prometheus Operator ServiceMonitor
+// CRD is installed in the cluster.
+func (r *LLMReconciler) serviceMonitorSupported() bool {
+	_, err := r.RESTMapper().RESTMapping(schema.GroupKind{
+		Group: monitoringv1.SchemeGroupVersion.Group,
+		Kind:  "ServiceMonitor",
+	})
+	return err == nil
+}
+
+// reconcileServiceMonitor creates or updates a ServiceMonitor when monitoring is
+// enabled and the CRD is present, and deletes it otherwise. When monitoring is
+// requested but the CRD is absent, it logs and skips rather than failing.
+func (r *LLMReconciler) reconcileServiceMonitor(ctx context.Context, llm *llmv1alpha1.LLM) error {
+	log := logf.FromContext(ctx)
+
+	enabled := llm.Spec.Monitoring != nil && llm.Spec.Monitoring.ServiceMonitor
+	supported := r.serviceMonitorSupported()
+
+	if !supported {
+		if enabled {
+			log.Info("ServiceMonitor requested but the Prometheus Operator CRD is not installed; skipping")
+		}
+		return nil
+	}
+
+	key := client.ObjectKey{Name: llm.Name, Namespace: llm.Namespace}
+	if !enabled {
+		existing := &monitoringv1.ServiceMonitor{}
+		if err := r.Get(ctx, key, existing); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if err := r.Delete(ctx, existing); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		log.Info("Deleted ServiceMonitor", "name", existing.Name)
+		return nil
+	}
+
+	sm := &monitoringv1.ServiceMonitor{
+		ObjectMeta: metav1.ObjectMeta{Name: llm.Name, Namespace: llm.Namespace},
+	}
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, sm, func() error {
+		desired := buildServiceMonitor(llm)
+		sm.Labels = desired.Labels
+		sm.Spec = desired.Spec
+		return controllerutil.SetControllerReference(llm, sm, r.Scheme)
+	})
+	if err != nil {
+		return err
+	}
+	if op != controllerutil.OperationResultNone {
+		log.Info("Reconciled ServiceMonitor", "operation", op, "name", sm.Name)
+	}
+	return nil
+}
+
 // updateStatus refreshes the LLM status from the backing Deployment.
 func (r *LLMReconciler) updateStatus(ctx context.Context, llm *llmv1alpha1.LLM) error {
 	var deploy appsv1.Deployment
@@ -273,12 +382,19 @@ func (r *LLMReconciler) markDegraded(ctx context.Context, llm *llmv1alpha1.LLM, 
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *LLMReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&llmv1alpha1.LLM{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
-		Named("llm").
-		Complete(r)
+		Owns(&networkingv1.Ingress{})
+
+	// Only watch ServiceMonitors when the Prometheus Operator CRD is installed;
+	// otherwise the informer would fail to start.
+	if r.serviceMonitorSupported() {
+		builder = builder.Owns(&monitoringv1.ServiceMonitor{})
+	}
+
+	return builder.Named("llm").Complete(r)
 }

@@ -35,6 +35,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+
 	llmv1alpha1 "github.com/youngcheor/vllm-operator/api/v1alpha1"
 	"github.com/youngcheor/vllm-operator/internal/controller"
 	// +kubebuilder:scaffold:imports
@@ -49,6 +51,9 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(llmv1alpha1.AddToScheme(scheme))
+	// ServiceMonitor types are optional at runtime; registering the scheme is
+	// harmless even when the Prometheus Operator CRDs are absent.
+	utilruntime.Must(monitoringv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 

@@ -22,9 +22,11 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -82,6 +84,8 @@ var _ = Describe("LLM Controller", func() {
 		_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
 		_ = k8sClient.Delete(ctx, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name + "-cache", Namespace: namespace}})
 		_ = k8sClient.Delete(ctx, &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
+		_ = k8sClient.Delete(ctx, &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
+		_ = k8sClient.Delete(ctx, &monitoringv1.ServiceMonitor{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
 	}
 
 	getDeployment := func(name string) *appsv1.Deployment {
@@ -408,6 +412,116 @@ var _ = Describe("LLM Controller", func() {
 
 			reconcileOnce(resourceName)
 			_, err = getHPA(resourceName)
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+		})
+	})
+
+	Context("When an Ingress is configured", func() {
+		const resourceName = "test-ingress"
+
+		BeforeEach(func() {
+			llm := &llmv1alpha1.LLM{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace},
+				Spec: llmv1alpha1.LLMSpec{
+					Model: "Qwen/Qwen2.5-1.5B-Instruct",
+					Ingress: &llmv1alpha1.IngressSpec{
+						Host:          "qwen.example.com",
+						ClassName:     ptr.To("nginx"),
+						TLSSecretName: "qwen-tls",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, llm)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			deleteLLM(resourceName)
+		})
+
+		getIngress := func() (*networkingv1.Ingress, error) {
+			ing := &networkingv1.Ingress{}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName, Namespace: namespace}, ing)
+			return ing, err
+		}
+
+		It("creates an Ingress routing to the Service and cleans it up when removed", func() {
+			reconcileOnce(resourceName)
+
+			ing, err := getIngress()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(*ing.Spec.IngressClassName).To(Equal("nginx"))
+			Expect(ing.Spec.Rules).To(HaveLen(1))
+			rule := ing.Spec.Rules[0]
+			Expect(rule.Host).To(Equal("qwen.example.com"))
+			backend := rule.HTTP.Paths[0].Backend.Service
+			Expect(backend.Name).To(Equal(resourceName))
+			Expect(backend.Port.Number).To(Equal(int32(8000)))
+			Expect(ing.Spec.TLS).To(HaveLen(1))
+			Expect(ing.Spec.TLS[0].SecretName).To(Equal("qwen-tls"))
+			Expect(ing.OwnerReferences).To(HaveLen(1))
+
+			By("removing the ingress spec")
+			llm := &llmv1alpha1.LLM{}
+			key := types.NamespacedName{Name: resourceName, Namespace: namespace}
+			Expect(k8sClient.Get(ctx, key, llm)).To(Succeed())
+			llm.Spec.Ingress = nil
+			Expect(k8sClient.Update(ctx, llm)).To(Succeed())
+
+			reconcileOnce(resourceName)
+			_, err = getIngress()
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+		})
+	})
+
+	Context("When monitoring is enabled", func() {
+		const resourceName = "test-monitor"
+
+		BeforeEach(func() {
+			llm := &llmv1alpha1.LLM{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: namespace},
+				Spec: llmv1alpha1.LLMSpec{
+					Model: "Qwen/Qwen2.5-1.5B-Instruct",
+					Monitoring: &llmv1alpha1.MonitoringSpec{
+						ServiceMonitor: true,
+						Interval:       "15s",
+						Labels:         map[string]string{"release": "kube-prometheus-stack"},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, llm)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			deleteLLM(resourceName)
+		})
+
+		getSM := func() (*monitoringv1.ServiceMonitor, error) {
+			sm := &monitoringv1.ServiceMonitor{}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName, Namespace: namespace}, sm)
+			return sm, err
+		}
+
+		It("creates a ServiceMonitor scraping /metrics and cleans it up when disabled", func() {
+			reconcileOnce(resourceName)
+
+			sm, err := getSM()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sm.Labels).To(HaveKeyWithValue("release", "kube-prometheus-stack"))
+			Expect(sm.Spec.Endpoints).To(HaveLen(1))
+			Expect(sm.Spec.Endpoints[0].Port).To(Equal("http"))
+			Expect(sm.Spec.Endpoints[0].Path).To(Equal("/metrics"))
+			Expect(sm.Spec.Endpoints[0].Interval).To(Equal(monitoringv1.Duration("15s")))
+			Expect(sm.OwnerReferences).To(HaveLen(1))
+
+			By("disabling monitoring")
+			llm := &llmv1alpha1.LLM{}
+			key := types.NamespacedName{Name: resourceName, Namespace: namespace}
+			Expect(k8sClient.Get(ctx, key, llm)).To(Succeed())
+			llm.Spec.Monitoring = nil
+			Expect(k8sClient.Update(ctx, llm)).To(Succeed())
+
+			reconcileOnce(resourceName)
+			_, err = getSM()
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 	})
