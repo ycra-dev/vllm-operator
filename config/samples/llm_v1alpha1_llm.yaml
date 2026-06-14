@@ -1,0 +1,9 @@
+apiVersion: llm.vllm-operator.io/v1alpha1
+kind: LLM
+metadata:
+  labels:
+    app.kubernetes.io/name: vllm-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: llm-sample
+spec:
+  # TODO(user): Add fields here
